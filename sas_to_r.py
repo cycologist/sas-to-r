@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""A small SAS-to-R converter for common DATA steps and simple procedures.
+"""A small SAS-to-R converter for common DATA steps and selected procedures.
 
-This is intentionally a basic converter.  It produces base-R code and does not
-try to cover the full SAS language.  Unsupported features are reported as
-warnings (and, where useful, as TODO comments in the generated R script).
+This is intentionally a practical converter.  It produces base-R code (plus a
+few recommended R packages for mixed, ordinal, multinomial, and CFA models)
+and does not try to cover the full SAS language.  Unsupported features are
+reported as warnings (and, where useful, as TODO comments in the generated R
+script).
 
 Usage:
     python3 sas_to_r.py input.sas
@@ -654,6 +656,13 @@ class SasToRConverter:
         self.reg_index = 0
         self.freq_index = 0
         self.logit_index = 0
+        self.glm_index = 0
+        self.mixed_index = 0
+        self.ttest_index = 0
+        self.npar_index = 0
+        self.genmod_index = 0
+        self.null_index = 0
+        self.filenames: dict[str, str] = {}
 
     # -- small utilities -------------------------------------------------
 
@@ -681,6 +690,205 @@ class SasToRConverter:
         if self.body and lines and self.body[-1] != "":
             self.body.append("")
         self.body.extend(lines)
+
+    def _handle_filename(self, statement: str) -> None:
+        body = re.sub(r"(?is)^filename\s+", "", statement).strip()
+        match = re.match(r"([A-Za-z_][A-Za-z0-9_]*)\s+(.+)$", body, re.S)
+        if not match:
+            self.warn(f"Could not read FILENAME statement: {statement}")
+            return
+        reference = match.group(1).lower()
+        rest = match.group(2).strip()
+        if rest.lower() == "clear":
+            self.filenames.pop(reference, None)
+            return
+        if rest.lower().startswith(("url ", "pipe ", "ftp ", "email ")):
+            self.warn(
+                "FILENAME access methods other than local files are not "
+                f"supported: {statement}"
+            )
+            return
+        path_match = re.match(
+            r"(?:'((?:[^']|'')*)'|\"((?:[^\"]|\"\")*)\"|(\S+))",
+            rest,
+            re.S,
+        )
+        if not path_match:
+            self.warn(f"Could not read the path in FILENAME: {statement}")
+            return
+        raw_path = (
+            path_match.group(1)
+            or path_match.group(2)
+            or path_match.group(3)
+            or ""
+        )
+        self.filenames[reference] = sas_string_to_plain(raw_path)
+
+    def _parse_file_spec(
+        self, statement: str, keyword: str
+    ) -> dict[str, object] | None:
+        body = re.sub(
+            rf"(?is)^{re.escape(keyword)}\s+", "", statement
+        ).strip()
+        path_match = re.match(
+            r"(?:'((?:[^']|'')*)'|\"((?:[^\"]|\"\")*)\"|"
+            r"([A-Za-z_][A-Za-z0-9_]*))",
+            body,
+            re.S,
+        )
+        if not path_match:
+            self.warn(f"Could not read a file path from: {statement}")
+            return None
+
+        raw_path = (
+            path_match.group(1)
+            or path_match.group(2)
+            or path_match.group(3)
+            or ""
+        )
+        plain_path = sas_string_to_plain(raw_path)
+        if path_match.group(3):
+            reference = plain_path.lower()
+            if reference in self.filenames:
+                plain_path = self.filenames[reference]
+            else:
+                self.warn(
+                    f"Fileref '{plain_path}' was not defined with FILENAME; "
+                    "it will be used as a literal path."
+                )
+
+        options_text = body[path_match.end() :]
+        delimiter: str | None = None
+        hex_delimiter = re.search(
+            r"(?i)\b(?:dlm|delimiter)\s*=\s*'([0-9A-Fa-f]+)'x",
+            options_text,
+        )
+        text_delimiter = re.search(
+            r"(?i)\b(?:dlm|delimiter)\s*=\s*"
+            r"(?:'([^']*)'|\"([^\"]*)\"|(\S+))",
+            options_text,
+        )
+        if hex_delimiter:
+            try:
+                delimiter = bytes.fromhex(hex_delimiter.group(1)).decode(
+                    "latin-1"
+                )
+            except ValueError:
+                self.warn(
+                    "Could not decode a hexadecimal DLM value in: "
+                    f"{statement}"
+                )
+        elif text_delimiter:
+            delimiter = (
+                text_delimiter.group(1)
+                or text_delimiter.group(2)
+                or text_delimiter.group(3)
+                or ""
+            )
+        if delimiter and len(delimiter) > 1:
+            self.warn(
+                "R supports a single-character delimiter; using the first "
+                f"character of {delimiter!r}."
+            )
+            delimiter = delimiter[0]
+
+        firstobs_match = re.search(
+            r"(?i)\bfirstobs\s*=\s*(\d+)", options_text
+        )
+        obs_match = re.search(r"(?i)\bobs\s*=\s*(\d+)", options_text)
+        return {
+            "path": plain_path,
+            "delimiter": delimiter,
+            "dsd": bool(re.search(r"(?i)\bdsd\b", options_text)),
+            "firstobs": int(firstobs_match.group(1))
+            if firstobs_match
+            else 1,
+            "obs": int(obs_match.group(1)) if obs_match else None,
+            "mod": bool(re.search(r"(?i)\bmod\b", options_text)),
+        }
+
+    def _infile_read_lines(
+        self,
+        r_name: str,
+        spec: dict[str, object],
+        input_vars: list[str],
+        input_types: list[str] | None,
+    ) -> list[str]:
+        delimiter = spec.get("delimiter")
+        dsd = bool(spec.get("dsd"))
+        separator = (
+            str(delimiter)
+            if delimiter is not None
+            else ("," if dsd else "")
+        )
+        quote = '"' if dsd else ""
+        firstobs = int(spec.get("firstobs", 1))
+        observations = spec.get("obs")
+
+        lines = [f"{r_name} <- read.table("]
+        lines.append(f"  file = {r_string(str(spec['path']))},")
+        lines.append("  header = FALSE,")
+        lines.append(f"  sep = {r_string(separator)},")
+        lines.append(f"  quote = {r_string(quote)},")
+        lines.append("  stringsAsFactors = FALSE,")
+        lines.append("  comment.char = \"\",")
+        lines.append("  fill = TRUE,")
+        lines.append("  check.names = FALSE,")
+        lines.append("  na.strings = c(\"NA\", \".\"),")
+        if firstobs > 1:
+            lines.append(f"  skip = {firstobs - 1},")
+        if observations is not None:
+            # SAS OBS= gives the last observation number, not a row count.
+            row_count = max(0, int(observations) - firstobs + 1)
+            lines.append(f"  nrows = {row_count},")
+        if input_types and all(t == "numeric" for t in input_types):
+            lines.append("  colClasses = \"numeric\"")
+        elif input_types and all(t == "character" for t in input_types):
+            lines.append("  colClasses = \"character\"")
+        elif input_types:
+            classes = ", ".join(r_string(t) for t in input_types)
+            lines.append(f"  colClasses = c({classes})")
+        else:
+            lines.append("  colClasses = \"character\"")
+        lines.append(")")
+        names = ", ".join(r_string(name) for name in input_vars)
+        lines.append(f"names({r_name}) <- c({names})")
+        return lines
+
+    def _file_write_lines(
+        self,
+        r_name: str,
+        spec: dict[str, object],
+        put_vars: list[str],
+        rename_map: dict[str, str],
+    ) -> list[str]:
+        delimiter = spec.get("delimiter")
+        dsd = bool(spec.get("dsd"))
+        separator = (
+            str(delimiter)
+            if delimiter is not None
+            else ("," if dsd else " ")
+        )
+        if put_vars:
+            columns = [rename_map.get(name, name) for name in put_vars]
+            column_expression = "c(" + ", ".join(
+                r_string(name) for name in columns
+            ) + ")"
+        else:
+            column_expression = f"names({r_name})"
+
+        lines = ["write.table("]
+        lines.append(f"  {r_name}[, {column_expression}, drop = FALSE],")
+        lines.append(f"  file = {r_string(str(spec['path']))},")
+        lines.append(f"  sep = {r_string(separator)},")
+        lines.append("  row.names = FALSE,")
+        lines.append("  col.names = FALSE,")
+        lines.append(f"  quote = {'TRUE' if dsd else 'FALSE'},")
+        lines.append("  na = \".\",")
+        lines.append(f"  append = {'TRUE' if spec.get('mod') else 'FALSE'},")
+        lines.append("  qmethod = \"double\"")
+        lines.append(")")
+        return lines
 
     # -- top level -------------------------------------------------------
 
@@ -718,11 +926,14 @@ class SasToRConverter:
                 self.warn(f"SAS macro statement not converted: {statement}")
                 self.body.append(f"# TODO: SAS macro statement: {statement}")
                 i += 1
-            elif keyword in {"filename", "infile"}:
+            elif keyword == "filename":
+                self._handle_filename(statement)
+                i += 1
+            elif keyword == "infile":
                 self.warn(
-                    f"External-file statement not converted: {statement}"
+                    "INFILE outside a DATA step is not supported: "
+                    f"{statement}"
                 )
-                self.body.append(f"# TODO: external file statement: {statement}")
                 i += 1
             else:
                 self.warn(f"Unsupported top-level statement: {statement}")
@@ -762,14 +973,30 @@ class SasToRConverter:
             return start + 1
 
         sas_name = match.group(1)
-        if sas_name.lower() == "_null_" or sas_name.lower().endswith("._null_"):
-            self.warn("DATA _NULL_ is not supported; the step was skipped.")
-            self.body.append(f"# TODO: DATA _NULL_ step: {header}")
-            return self._find_block_end(statements, start + 1)
+        step_statements, next_index = self._collect_block(statements, start + 1)
+        is_null = (
+            sas_name.lower() == "_null_"
+            or sas_name.lower().endswith("._null_")
+        )
+        if is_null:
+            if not any(
+                first_word(statement) in {"file", "put"}
+                for statement in step_statements
+            ):
+                self.warn("DATA _NULL_ without FILE/PUT was skipped.")
+                self.body.append(f"# TODO: DATA _NULL_ step: {header}")
+                return next_index
+            self.null_index += 1
+            r_name = f"null_data_{self.null_index}"
+            self.add_lines(
+                self._convert_data_step(
+                    "_NULL_", r_name, step_statements, datalines
+                )
+            )
+            return next_index
 
         r_name = dataset_r_name(sas_name)
         self.register_dataset(sas_name, r_name)
-        step_statements, next_index = self._collect_block(statements, start + 1)
         self.add_lines(
             self._convert_data_step(sas_name, r_name, step_statements, datalines)
         )
@@ -788,6 +1015,9 @@ class SasToRConverter:
         input_vars: list[str] | None = None
         input_types: list[str] | None = None
         data_block: list[str] | None = None
+        infile_spec: dict[str, object] | None = None
+        output_file: dict[str, object] | None = None
+        put_vars: list[str] | None = None
         input_seen = False
 
         # First pass: find the input source, input variables and DATALINES.
@@ -812,21 +1042,50 @@ class SasToRConverter:
                     self.warn("Only the first DATALINES block is used.")
                 data_block = datalines.get(statement.upper(), [])
             elif keyword == "infile":
-                self.warn(
-                    "INFILE is not supported; DATALINES input is assumed."
-                )
-
-        if source is not None and data_block is not None:
-            self.warn(
-                "Both SET and DATALINES are present; SET is used as the "
-                "input source."
-            )
-            data_block = None
+                if infile_spec is not None:
+                    self.warn("Only the first INFILE statement is used.")
+                else:
+                    infile_spec = self._parse_file_spec(
+                        statement, "infile"
+                    )
 
         # Initialise the R data frame.
         if source is not None:
+            if data_block is not None:
+                self.warn(
+                    "Both SET and DATALINES are present; SET is used as the "
+                    "input source."
+                )
+                data_block = None
+            if infile_spec is not None:
+                self.warn(
+                    "Both SET and INFILE are present; SET is used as the "
+                    "input source."
+                )
+                infile_spec = None
             lines.append(f"{r_name} <- {source}")
             known_columns: set[str] | None = None
+        elif infile_spec is not None:
+            if data_block is not None:
+                self.warn(
+                    "Both INFILE and DATALINES are present; INFILE is used "
+                    "as the input source."
+                )
+                data_block = None
+            if input_vars is None:
+                self.warn(
+                    "INFILE was found without a usable INPUT statement; "
+                    "the external file was not read."
+                )
+                lines.append(f"{r_name} <- data.frame()")
+                known_columns = set()
+            else:
+                lines.extend(
+                    self._infile_read_lines(
+                        r_name, infile_spec, input_vars, input_types
+                    )
+                )
+                known_columns = set(input_vars)
         elif data_block is not None:
             if input_vars is None:
                 self.warn(
@@ -857,8 +1116,7 @@ class SasToRConverter:
                 known_columns = set(input_vars)
         elif input_seen:
             self.warn(
-                "INPUT without DATALINES reads an external file, which this "
-                "converter does not handle."
+                "INPUT without SET, INFILE, or DATALINES was skipped."
             )
             lines.append(f"{r_name} <- data.frame()")
             known_columns = set()
@@ -983,7 +1241,36 @@ class SasToRConverter:
                 i += 1
                 continue
 
-            if keyword in {"file", "put", "list", "call"}:
+            if keyword == "file":
+                if output_file is not None:
+                    self.warn("Only the first FILE statement is used.")
+                else:
+                    output_file = self._parse_file_spec(statement, "file")
+                i += 1
+                continue
+
+            if keyword == "put":
+                if put_vars is not None:
+                    self.warn("Only the first PUT statement is used.")
+                    i += 1
+                    continue
+                body = re.sub(r"(?is)^put\s+", "", statement).strip()
+                if "_all_" in body.lower():
+                    put_vars = []
+                elif "'" in body or '"' in body or "@" in body:
+                    self.warn(
+                        "PUT with quoted text, formats, or column pointers "
+                        f"is not supported: {statement}"
+                    )
+                else:
+                    put_vars = parse_var_list(body)
+                    if not put_vars:
+                        self.warn(f"Could not read PUT variables: {statement}")
+                        put_vars = None
+                i += 1
+                continue
+
+            if keyword in {"list", "call"}:
                 self.warn(f"DATA step {keyword.upper()} is not supported: {statement}")
                 i += 1
                 continue
@@ -1020,6 +1307,26 @@ class SasToRConverter:
         for variable, label in labels:
             variable = rename_map.get(variable, variable)
             lines.append(f"attr({r_name}${variable}, \"label\") <- {r_string(label)}")
+
+        # FILE/PUT uses the DATA step variables as they exist before
+        # KEEP/DROP/RENAME, which affect the output data set rather than the
+        # program data vector.
+        if output_file is not None:
+            if put_vars is None:
+                self.warn(
+                    "FILE was found without a usable PUT statement; no "
+                    "external file was written."
+                )
+            else:
+                lines.extend(
+                    self._file_write_lines(
+                        r_name, output_file, put_vars, {}
+                    )
+                )
+        elif put_vars is not None:
+            self.warn(
+                "PUT without FILE writes to the SAS log and was not converted."
+            )
 
         if keep_vars:
             keep_vars = [rename_map.get(name, name) for name in keep_vars]
@@ -1156,6 +1463,12 @@ class SasToRConverter:
             if re.fullmatch(r"\d+(?:\.\d*)?", token):
                 # Numeric format such as 8. or 12.2
                 continue
+            if re.fullmatch(r"\d+\s*-\s*\d+", token):
+                self.warn(
+                    "Fixed-width INPUT column ranges are not supported; "
+                    f"token ignored: {token}"
+                )
+                continue
             if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", token):
                 names.append(token)
                 types.append("numeric")
@@ -1176,6 +1489,62 @@ class SasToRConverter:
             (name, sas_string_to_plain(raw))
             for name, raw in pattern.findall(body)
         ]
+
+    def _get_class_variables(self, statements: list[str]) -> list[str]:
+        variables: list[str] = []
+        for statement in statements:
+            if first_word(statement) != "class":
+                continue
+            class_text = re.sub(
+                r"(?is)^class\s+", "", statement
+            ).split("/", 1)[0]
+            class_text = re.sub(r"\([^)]*\)", " ", class_text)
+            variables.extend(
+                name.lower() for name in parse_var_list(class_text)
+            )
+        return variables
+
+    def _format_model_rhs(
+        self, right: str, class_variables: list[str]
+    ) -> str:
+        right = re.sub(r"\s*\*\s*", "*", right.strip())
+        terms = right.split() if right.strip() else ["1"]
+        converted_terms: list[str] = []
+        for term in terms:
+            pieces = term.split("*")
+            pieces = [
+                f"factor({piece})" if piece.lower() in class_variables
+                else piece
+                for piece in pieces
+            ]
+            converted_terms.append("*".join(pieces))
+        return " + ".join(converted_terms)
+
+    def _parse_model_statement(
+        self, statement: str
+    ) -> tuple[str, str, set[str]] | None:
+        body = re.sub(r"(?is)^model\s+", "", statement).strip()
+        model_options = ""
+        if "/" in body:
+            body, model_options = body.split("/", 1)
+        equation = split_model_equation(body)
+        if equation is None:
+            self.warn(f"Could not read MODEL statement: {statement}")
+            return None
+        left, right = equation
+        dependent = parse_var_list(left)
+        if not dependent:
+            self.warn(f"Could not read dependent variable: {statement}")
+            return None
+        if len(dependent) > 1:
+            self.warn(
+                "Only the first dependent variable in MODEL is used: "
+                f"{statement}"
+            )
+        option_words = set(
+            re.findall(r"[a-z_][a-z0-9_]*", model_options.lower())
+        )
+        return dependent[0], right, option_words
 
     def _collect_block(
         self, statements: list[str], start: int
@@ -1222,6 +1591,12 @@ class SasToRConverter:
             "calis": self._proc_calis,
             "reg": self._proc_reg,
             "logistic": self._proc_logistic,
+            "glm": self._proc_glm,
+            "anova": self._proc_glm,
+            "mixed": self._proc_mixed,
+            "ttest": self._proc_ttest,
+            "npar1way": self._proc_npar1way,
+            "genmod": self._proc_genmod,
         }.get(proc_name)
 
         if handler is None:
@@ -1758,6 +2133,494 @@ class SasToRConverter:
             )
             self.body.append(f"print(summary({fit_name}))")
 
+    def _proc_glm(
+        self,
+        proc_name: str,
+        options: dict[str, str | bool],
+        statements: list[str],
+    ) -> None:
+        source = self._get_dataset(options)
+        weight = self._get_weight_variable(statements)
+        class_variables = self._get_class_variables(statements)
+        model_statements = [
+            statement for statement in statements
+            if first_word(statement) == "model"
+        ]
+        means_statements = [
+            statement for statement in statements
+            if first_word(statement) == "means"
+        ]
+        if any(first_word(statement) == "by" for statement in statements):
+            self.warn(f"BY processing in PROC {proc_name.upper()} is not reproduced.")
+        for statement in statements:
+            keyword = first_word(statement)
+            if keyword in {
+                "lsmeans", "contrast", "estimate", "test", "repeated", "manova",
+            }:
+                self.warn(
+                    f"{keyword.upper()} in PROC {proc_name.upper()} is not "
+                    f"reproduced: {statement}"
+                )
+        if not model_statements:
+            self.warn(f"PROC {proc_name.upper()} without a MODEL statement was skipped.")
+            return
+
+        for statement in model_statements:
+            parsed = self._parse_model_statement(statement)
+            if parsed is None:
+                continue
+            response, right, model_options = parsed
+            rhs = self._format_model_rhs(right, class_variables)
+            formula = f"{response} ~ {rhs}"
+            if "noint" in model_options:
+                formula += " - 1"
+
+            self.glm_index += 1
+            fit_name = f"glm_fit_{self.glm_index}"
+            weight_arg = (
+                f", weights = {source}${weight}" if weight else ""
+            )
+            self.body.append(f"# ---- proc {proc_name}: {source} ----")
+            self.body.append(
+                f"{fit_name} <- stats::lm({formula}, data = {source}"
+                f"{weight_arg})"
+            )
+            self.body.append(f"print(summary({fit_name}))")
+            self.body.append(f"print(stats::anova({fit_name}))")
+
+            for means_statement in means_statements:
+                if "/" in means_statement:
+                    self.warn(
+                        "MEANS options are not reproduced: "
+                        f"{means_statement}"
+                    )
+                means_body = re.sub(
+                    r"(?is)^means\s+", "", means_statement
+                ).split("/", 1)[0]
+                means_variables = parse_var_list(means_body)
+                if not means_variables:
+                    self.warn(
+                        f"Could not read MEANS statement: {means_statement}"
+                    )
+                    continue
+                for variable in means_variables:
+                    self.body.append(
+                        f"print(stats::aggregate({response} ~ {variable}, "
+                        f"data = {source}, FUN = mean, na.rm = TRUE))"
+                    )
+
+    def _mixed_random_formula(
+        self, statements: list[str], class_variables: list[str]
+    ) -> str | None:
+        random_statements = [
+            statement for statement in statements
+            if first_word(statement) == "random"
+        ]
+        if not random_statements:
+            return None
+        if len(random_statements) > 1:
+            self.warn("Only the first RANDOM statement is used in PROC MIXED.")
+        statement = random_statements[0]
+        body = re.sub(r"(?is)^random\s+", "", statement).strip()
+        random_options = ""
+        if "/" in body:
+            body, random_options = body.split("/", 1)
+        effects = parse_var_list(body)
+        if not effects:
+            self.warn(f"Could not read RANDOM statement: {statement}")
+            return None
+
+        subject_match = re.search(
+            r"(?i)\bsubject\s*=\s*([A-Za-z_][A-Za-z0-9_]*)",
+            random_options,
+        )
+        subject = subject_match.group(1) if subject_match else None
+        if subject is None:
+            if len(effects) == 1:
+                subject = effects[0]
+                effects = ["intercept"]
+            else:
+                self.warn(
+                    "RANDOM with several effects needs a SUBJECT= option: "
+                    f"{statement}"
+                )
+                return None
+        if not effects:
+            effects = ["intercept"]
+        if len(effects) == 1 and effects[0].lower() == subject.lower():
+            effects = ["intercept"]
+
+        type_match = re.search(
+            r"(?i)\btype\s*=\s*([A-Za-z0-9_()]+)", random_options
+        )
+        if type_match and type_match.group(1).lower() not in {
+            "un", "un(1)", "vc", "vc(1)",
+        }:
+            self.warn(
+                f"RANDOM covariance TYPE={type_match.group(1)} is not "
+                "reproduced; nlme's unstructured random effects are used."
+            )
+
+        effect_terms: list[str] = []
+        has_intercept = False
+        for effect in effects:
+            if effect.lower() in {"intercept", "int"}:
+                has_intercept = True
+            else:
+                if effect.lower() in class_variables:
+                    self.warn(
+                        f"Random effect '{effect}' is a CLASS variable; "
+                        "review the generated random-effects formula."
+                    )
+                effect_terms.append(effect)
+        if not effect_terms:
+            return f"~ 1 | {subject}"
+        prefix = "1 + " if has_intercept else "0 + "
+        return f"~ {prefix}{' + '.join(effect_terms)} | {subject}"
+
+    def _proc_mixed(
+        self,
+        proc_name: str,
+        options: dict[str, str | bool],
+        statements: list[str],
+    ) -> None:
+        source = self._get_dataset(options)
+        weight = self._get_weight_variable(statements)
+        class_variables = self._get_class_variables(statements)
+        model_statements = [
+            statement for statement in statements
+            if first_word(statement) == "model"
+        ]
+        if not model_statements:
+            self.warn("PROC MIXED without a MODEL statement was skipped.")
+            return
+        if any(first_word(statement) == "by" for statement in statements):
+            self.warn("BY processing in PROC MIXED is not reproduced.")
+        for statement in statements:
+            keyword = first_word(statement)
+            if keyword in {
+                "repeated", "lsmeans", "contrast", "estimate", "test",
+                "slice", "store",
+            }:
+                self.warn(
+                    f"{keyword.upper()} in PROC MIXED is not reproduced: "
+                    f"{statement}"
+                )
+
+        random_statements = [
+            statement for statement in statements
+            if first_word(statement) == "random"
+        ]
+        random_formula = self._mixed_random_formula(
+            statements, class_variables
+        )
+        if not random_statements:
+            self.warn(
+                "PROC MIXED without RANDOM is fitted as a fixed-effects "
+                "model with lm()."
+            )
+
+        method = str(options.get("method", "reml")).upper()
+        if method not in {"REML", "ML"}:
+            self.warn(
+                f"METHOD={method} is not recognized; REML is used."
+            )
+            method = "REML"
+
+        for statement in model_statements:
+            parsed = self._parse_model_statement(statement)
+            if parsed is None:
+                continue
+            response, right, model_options = parsed
+            rhs = self._format_model_rhs(right, class_variables)
+            formula = f"{response} ~ {rhs}"
+            if "noint" in model_options:
+                formula += " - 1"
+
+            self.mixed_index += 1
+            fit_name = f"mixed_fit_{self.mixed_index}"
+            self.body.append(f"# ---- proc mixed: {source} ----")
+            if random_formula is None:
+                weight_arg = (
+                    f", weights = {source}${weight}" if weight else ""
+                )
+                self.body.append(
+                    f"{fit_name} <- stats::lm({formula}, data = {source}"
+                    f"{weight_arg})"
+                )
+            else:
+                self.body.append(f"{fit_name} <- nlme::lme(")
+                self.body.append(f"  fixed = {formula},")
+                self.body.append(f"  random = {random_formula},")
+                self.body.append(f"  data = {source},")
+                if method != "REML":
+                    self.body.append(f"  method = {r_string(method)},")
+                if weight:
+                    self.body.append(
+                        f"  weights = ~ I(1 / {weight}),"
+                    )
+                self.body.append("  na.action = stats::na.omit")
+                self.body.append(")")
+            self.body.append(f"print(summary({fit_name}))")
+            self.body.append(f"print(stats::anova({fit_name}))")
+
+    def _proc_ttest(
+        self,
+        proc_name: str,
+        options: dict[str, str | bool],
+        statements: list[str],
+    ) -> None:
+        source = self._get_dataset(options)
+        if any(first_word(statement) == "weight" for statement in statements):
+            self.warn("WEIGHT in PROC TTEST is ignored.")
+        if any(first_word(statement) == "by" for statement in statements):
+            self.warn("BY processing in PROC TTEST is not reproduced.")
+
+        class_variables = self._get_class_variables(statements)
+        if len(class_variables) > 1:
+            self.warn(
+                "PROC TTEST uses one CLASS variable; the first is used."
+            )
+        class_variable = class_variables[0] if class_variables else None
+        variables = self._get_var_statement(statements)
+        paired_statements = [
+            statement for statement in statements
+            if first_word(statement) == "paired"
+        ]
+        if not variables and not paired_statements:
+            self.warn("PROC TTEST without VAR or PAIRED was skipped.")
+            return
+
+        h0 = options.get("h0")
+        mu_arg = ""
+        if isinstance(h0, str) and re.fullmatch(r"[-+]?\d+(?:\.\d+)?", h0):
+            mu_arg = f", mu = {h0}"
+        elif h0 is not None:
+            self.warn(f"Could not read H0= value: {h0}")
+
+        sides = str(options.get("sides", "2")).upper()
+        alternative = {"2": "two.sided", "U": "greater", "L": "less"}.get(
+            sides
+        )
+        if alternative is None:
+            self.warn(f"SIDES={sides} is not recognized; using two-sided.")
+            alternative = "two.sided"
+        alternative_arg = f", alternative = {r_string(alternative)}"
+
+        self.body.append(f"# ---- proc ttest: {source} ----")
+        for variable in variables:
+            if class_variable:
+                self.body.append(
+                    f"if (nlevels(factor({source}${class_variable})) == 2L) {{"
+                )
+                self.body.append(
+                    f"  print(stats::t.test({variable} ~ "
+                    f"factor({class_variable}), data = {source}"
+                    f"{mu_arg}{alternative_arg}))"
+                )
+                self.body.append("} else {")
+                self.body.append(
+                    f"  print(stats::pairwise.t.test({source}${variable}, "
+                    f"factor({source}${class_variable}), "
+                    "p.adjust.method = \"none\"))"
+                )
+                self.body.append("}")
+            else:
+                self.body.append(
+                    f"print(stats::t.test({source}${variable}"
+                    f"{mu_arg}{alternative_arg}))"
+                )
+        for statement in paired_statements:
+            body = re.sub(r"(?is)^paired\s+", "", statement).split(
+                "/", 1
+            )[0]
+            paired_variables = parse_var_list(body)
+            if len(paired_variables) != 2:
+                self.warn(f"Could not read PAIRED statement: {statement}")
+                continue
+            first, second = paired_variables
+            self.body.append(
+                f"print(stats::t.test({source}${first}, {source}${second}, "
+                f"paired = TRUE{mu_arg}{alternative_arg}))"
+            )
+
+    def _proc_npar1way(
+        self,
+        proc_name: str,
+        options: dict[str, str | bool],
+        statements: list[str],
+    ) -> None:
+        source = self._get_dataset(options)
+        if any(first_word(statement) == "weight" for statement in statements):
+            self.warn("WEIGHT in PROC NPAR1WAY is ignored.")
+        if any(first_word(statement) == "by" for statement in statements):
+            self.warn("BY processing in PROC NPAR1WAY is not reproduced.")
+        class_variables = self._get_class_variables(statements)
+        variables = self._get_var_statement(statements)
+        if not class_variables:
+            self.warn("PROC NPAR1WAY requires a CLASS statement.")
+            return
+        if len(class_variables) > 1:
+            self.warn(
+                "PROC NPAR1WAY uses one CLASS variable; the first is used."
+            )
+        class_variable = class_variables[0]
+        if not variables:
+            self.warn("PROC NPAR1WAY without a VAR statement was skipped.")
+            return
+
+        self.npar_index += 1
+        self.body.append(f"# ---- proc npar1way: {source} ----")
+        for variable in variables:
+            self.body.append(
+                f"if (nlevels(factor({source}${class_variable})) == 2L) {{"
+            )
+            self.body.append(
+                f"  print(stats::wilcox.test({variable} ~ "
+                f"factor({class_variable}), data = {source}))"
+            )
+            self.body.append("} else {")
+            self.body.append(
+                f"  print(stats::kruskal.test({variable} ~ "
+                f"factor({class_variable}), data = {source}))"
+            )
+            self.body.append("}")
+
+    def _proc_genmod(
+        self,
+        proc_name: str,
+        options: dict[str, str | bool],
+        statements: list[str],
+    ) -> None:
+        source = self._get_dataset(options)
+        weight = self._get_weight_variable(statements)
+        class_variables = self._get_class_variables(statements)
+        model_statements = [
+            statement for statement in statements
+            if first_word(statement) == "model"
+        ]
+        if not model_statements:
+            self.warn("PROC GENMOD without a MODEL statement was skipped.")
+            return
+        if any(first_word(statement) == "by" for statement in statements):
+            self.warn("BY processing in PROC GENMOD is not reproduced.")
+        for statement in statements:
+            keyword = first_word(statement)
+            if keyword in {
+                "repeated", "lsmeans", "contrast", "estimate", "test",
+            }:
+                self.warn(
+                    f"{keyword.upper()} in PROC GENMOD is not reproduced: "
+                    f"{statement}"
+                )
+
+        for statement in model_statements:
+            body = re.sub(r"(?is)^model\s+", "", statement).strip()
+            model_options = ""
+            if "/" in body:
+                body, model_options = body.split("/", 1)
+            equation = split_model_equation(body)
+            if equation is None:
+                self.warn(f"Could not read MODEL statement: {statement}")
+                continue
+            left, right = equation
+            dependent = parse_var_list(left)
+            if not dependent:
+                self.warn(f"Could not read dependent variable: {statement}")
+                continue
+            response = dependent[0]
+            rhs = self._format_model_rhs(right, class_variables)
+            formula = f"{response} ~ {rhs}"
+            option_words = set(
+                re.findall(r"[a-z_][a-z0-9_]*", model_options.lower())
+            )
+            if "noint" in option_words:
+                formula += " - 1"
+
+            distribution_match = re.search(
+                r"(?i)\bdist\s*=\s*([A-Za-z_.]+)", model_options
+            )
+            link_match = re.search(
+                r"(?i)\blink\s*=\s*([A-Za-z0-9_/.^]+)", model_options
+            )
+            distribution = (
+                distribution_match.group(1).lower()
+                if distribution_match
+                else "normal"
+            )
+            link = link_match.group(1).lower() if link_match else ""
+
+            known_links = {
+                "identity", "log", "logit", "probit", "cloglog",
+                "inverse", "1/mu^2", "sqrt", "cauchit",
+            }
+            if link and link not in known_links:
+                self.warn(
+                    f"LINK={link} is not recognized; the distribution "
+                    "default is used."
+                )
+                link = ""
+
+            family = ""
+            if distribution in {"normal", "gaussian"}:
+                family = (
+                    f"stats::gaussian(link = {r_string(link or 'identity')})"
+                )
+            elif distribution in {"binomial", "binary"}:
+                family = (
+                    f"stats::binomial(link = {r_string(link or 'logit')})"
+                )
+            elif distribution == "poisson":
+                family = (
+                    f"stats::poisson(link = {r_string(link or 'log')})"
+                )
+            elif distribution == "gamma":
+                family = (
+                    f"stats::Gamma(link = {r_string(link or 'inverse')})"
+                )
+            elif distribution in {"inverse.gaussian", "inverse_gaussian"}:
+                family = (
+                    "stats::inverse.gaussian(link = "
+                    f"{r_string(link or '1/mu^2')})"
+                )
+            elif distribution in {"negbin", "negbinomial"}:
+                if link and link != "log":
+                    self.warn(
+                        "MASS::glm.nb uses a log link; LINK is ignored."
+                    )
+            elif distribution == "quasibinomial":
+                family = (
+                    f"stats::quasibinomial(link = {r_string(link or 'logit')})"
+                )
+            elif distribution == "quasipoisson":
+                family = (
+                    f"stats::quasipoisson(link = {r_string(link or 'log')})"
+                )
+            else:
+                self.warn(
+                    f"DIST={distribution} is not supported; Gaussian is used."
+                )
+                family = "stats::gaussian()"
+
+            self.genmod_index += 1
+            fit_name = f"genmod_fit_{self.genmod_index}"
+            weight_arg = (
+                f", weights = {source}${weight}" if weight else ""
+            )
+            self.body.append(f"# ---- proc genmod: {source} ----")
+            if distribution in {"negbin", "negbinomial"}:
+                self.body.append(
+                    f"{fit_name} <- MASS::glm.nb({formula}, "
+                    f"data = {source}{weight_arg})"
+                )
+            else:
+                self.body.append(
+                    f"{fit_name} <- stats::glm({formula}, data = {source}, "
+                    f"family = {family}{weight_arg})"
+                )
+            self.body.append(f"print(summary({fit_name}))")
+            self.body.append(f"print(stats::anova({fit_name}))")
+
     def _proc_logistic(
         self,
         proc_name: str,
@@ -1766,17 +2629,7 @@ class SasToRConverter:
     ) -> None:
         source = self._get_dataset(options)
         weight = self._get_weight_variable(statements)
-        class_variables: list[str] = []
-        for statement in statements:
-            if first_word(statement) != "class":
-                continue
-            class_text = re.sub(
-                r"(?is)^class\s+", "", statement
-            ).split("/", 1)[0]
-            class_text = re.sub(r"\([^)]*\)", " ", class_text)
-            class_variables.extend(
-                name.lower() for name in parse_var_list(class_text)
-            )
+        class_variables = self._get_class_variables(statements)
         model_statements = [
             statement for statement in statements
             if first_word(statement) == "model"
@@ -1795,10 +2648,6 @@ class SasToRConverter:
             model_options = ""
             if "/" in body:
                 body, model_options = body.split("/", 1)
-            if "=" not in body:
-                self.warn(f"Could not read MODEL statement: {statement}")
-                continue
-
             equation = split_model_equation(body)
             if equation is None:
                 self.warn(f"Could not read MODEL statement: {statement}")
@@ -1825,61 +2674,150 @@ class SasToRConverter:
             event_match = re.search(
                 r"(?i)event\s*=\s*['\"]?([^'\")\s]+)", left
             )
-            if event_match:
-                response_expression = (
-                    f"I({response} == {r_string(event_match.group(1))})"
-                )
-            else:
-                response_expression = response
+            event_value = event_match.group(1) if event_match else None
 
-            right = re.sub(r"\s*\*\s*", "*", right.strip())
-            right_terms = right.split() if right.strip() else ["1"]
-            converted_terms: list[str] = []
-            for term in right_terms:
-                pieces = term.split("*")
-                pieces = [
-                    f"factor({piece})" if piece.lower() in class_variables
-                    else piece
-                    for piece in pieces
-                ]
-                converted_terms.append("*".join(pieces))
-            formula = (
-                f"{response_expression} ~ {' + '.join(converted_terms)}"
+            link = ""
+            if isinstance(options.get("link"), str):
+                link = str(options["link"]).lower()
+            link_match = re.search(
+                r"(?i)\blink\s*=\s*([A-Za-z]+)", model_options
             )
+            if link_match:
+                link = link_match.group(1).lower()
+            if link not in {
+                "", "logit", "glogit", "probit", "cloglog", "loglog",
+                "cauchit",
+            }:
+                self.warn(
+                    f"LINK={link} is not supported; the logit link is used."
+                )
+                link = "logit"
+
+            rhs = self._format_model_rhs(right, class_variables)
             option_words = set(
                 re.findall(r"[a-z_][a-z0-9_]*", model_options.lower())
             )
-            if "noint" in option_words:
-                formula += " - 1"
-
-            self.logit_index += 1
-            fit_name = f"logit_fit_{self.logit_index}"
+            noint = "noint" in option_words
             weight_arg = (
                 f", weights = {source}${weight}" if weight else ""
             )
+            self.logit_index += 1
+            fit_name = f"logit_fit_{self.logit_index}"
             self.body.append(f"# ---- proc logistic: {source} ----")
+
+            if link == "glogit":
+                if event_value is not None:
+                    self.warn(
+                        "EVENT= is ignored when LINK=GLOGIT is used; "
+                        "multinomial probabilities are modeled."
+                    )
+                formula = f"factor({response}) ~ {rhs}"
+                if noint:
+                    formula += " - 1"
+                self.body.append(
+                    f"{fit_name} <- nnet::multinom({formula}, "
+                    f"data = {source}{weight_arg}, Hess = TRUE, "
+                    "trace = FALSE)"
+                )
+                self.body.append(f"print(summary({fit_name}))")
+                if "expb" in option_words:
+                    self.body.append(
+                        f"print(exp(stats::coef({fit_name})))"
+                    )
+                continue
+
+            binary_link = link or "logit"
+            if binary_link == "loglog":
+                self.warn(
+                    "The LOGLOG link is available for ordinal models but "
+                    "not for binary glm(); logit is used in that branch."
+                )
+                binary_link = "logit"
+            ordinal_method = {
+                "": "logistic",
+                "logit": "logistic",
+                "probit": "probit",
+                "cloglog": "cloglog",
+                "loglog": "loglog",
+                "cauchit": "cauchit",
+            }[link]
+
+            if event_value is not None:
+                response_expression = (
+                    f"I({response} == {r_string(event_value)})"
+                )
+                formula = f"{response_expression} ~ {rhs}"
+                if noint:
+                    formula += " - 1"
+                self.body.append(
+                    f"{fit_name} <- stats::glm({formula}, data = {source}, "
+                    f"family = stats::binomial(link = "
+                    f"{r_string(binary_link)}){weight_arg})"
+                )
+                self.body.append(f"print(summary({fit_name}))")
+                if "expb" in option_words:
+                    self._append_logistic_odds_ratios(fit_name)
+                continue
+
+            response_factor = f"{fit_name}_response"
             self.body.append(
-                f"{fit_name} <- stats::glm({formula}, data = {source}, "
-                f"family = stats::binomial(){weight_arg})"
+                f"{response_factor} <- ordered({source}${response})"
             )
+            ordinal_formula = f"{response_factor} ~ {rhs}"
+            binary_formula = ordinal_formula
+            if noint:
+                binary_formula += " - 1"
+                self.warn(
+                    "NOINT applies to the binary glm() branch; MASS::polr "
+                    "retains its intercepts."
+                )
+            self.body.append(
+                f"if (nlevels({response_factor}) > 2L) {{"
+            )
+            self.body.append(
+                f"  {fit_name} <- MASS::polr({ordinal_formula}, "
+                f"data = {source}, Hess = TRUE, method = "
+                f"{r_string(ordinal_method)}{weight_arg})"
+            )
+            self.body.append("} else {")
+            self.body.append(
+                f"  {fit_name} <- stats::glm({binary_formula}, "
+                f"data = {source}, family = stats::binomial(link = "
+                f"{r_string(binary_link)}){weight_arg})"
+            )
+            self.body.append("}")
             self.body.append(f"print(summary({fit_name}))")
             if "expb" in option_words:
-                coefficient_name = f"{fit_name}_coef"
-                standard_error_name = f"{fit_name}_se"
-                self.body.append(
-                    f"{coefficient_name} <- stats::coef({fit_name})"
-                )
-                self.body.append(
-                    f"{standard_error_name} <- "
-                    f"sqrt(diag(stats::vcov({fit_name})))"
-                )
-                self.body.append(
-                    f"print(exp(cbind(OR = {coefficient_name}, "
-                    f"`2.5 %` = {coefficient_name} - "
-                    f"1.96 * {standard_error_name}, "
-                    f"`97.5 %` = {coefficient_name} + "
-                    f"1.96 * {standard_error_name})))"
-                )
+                self._append_logistic_odds_ratios(fit_name, ordinal=True)
+
+    def _append_logistic_odds_ratios(
+        self, fit_name: str, ordinal: bool = False
+    ) -> None:
+        coefficient_name = f"{fit_name}_coef"
+        standard_error_name = f"{fit_name}_se"
+        self.body.append(
+            f"{coefficient_name} <- stats::coef({fit_name})"
+        )
+        if ordinal:
+            self.body.append(
+                f"{coefficient_name} <- {coefficient_name}["
+                f"!grepl(\"|\", names({coefficient_name}), fixed = TRUE)]"
+            )
+        self.body.append(
+            f"{standard_error_name} <- "
+            f"sqrt(diag(stats::vcov({fit_name})))"
+        )
+        self.body.append(
+            f"{standard_error_name} <- "
+            f"{standard_error_name}[names({coefficient_name})]"
+        )
+        self.body.append(
+            f"print(exp(cbind(OR = {coefficient_name}, "
+            f"`2.5 %` = {coefficient_name} - "
+            f"1.96 * {standard_error_name}, "
+            f"`97.5 %` = {coefficient_name} + "
+            f"1.96 * {standard_error_name})))"
+        )
 
     def _proc_calis(
         self,

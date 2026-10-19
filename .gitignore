@@ -8,6 +8,7 @@ venv/
 .Rhistory
 .RData
 .Rproj.user/
+examples/advanced_data.csv
 
 # Editors and operating systems
 .DS_Store

@@ -19,8 +19,9 @@ print(round(outer(rowSums(freq_table_1), colSums(freq_table_1)) / sum(freq_table
 print(chisq.test(freq_table_1, correct = FALSE))
 
 # ---- proc logistic: customers ----
-logit_fit_1 <- stats::glm(I(churn == "1") ~ age + income + factor(group), data = customers, family = stats::binomial())
+logit_fit_1 <- stats::glm(I(churn == "1") ~ age + income + factor(group), data = customers, family = stats::binomial(link = "logit"))
 print(summary(logit_fit_1))
 logit_fit_1_coef <- stats::coef(logit_fit_1)
 logit_fit_1_se <- sqrt(diag(stats::vcov(logit_fit_1)))
+logit_fit_1_se <- logit_fit_1_se[names(logit_fit_1_coef)]
 print(exp(cbind(OR = logit_fit_1_coef, `2.5 %` = logit_fit_1_coef - 1.96 * logit_fit_1_se, `97.5 %` = logit_fit_1_coef + 1.96 * logit_fit_1_se)))

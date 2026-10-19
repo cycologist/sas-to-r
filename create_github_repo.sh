@@ -34,7 +34,7 @@ EOF
 REPO_NAME=""
 VISIBILITY="${VISIBILITY:-private}"
 GIT_BRANCH="${GIT_BRANCH:-main}"
-REPO_DESCRIPTION="${REPO_DESCRIPTION:-A basic, dependency-free SAS to R converter with examples}"
+REPO_DESCRIPTION="${REPO_DESCRIPTION:-A practical, dependency-free SAS to R converter with examples}"
 
 while (($# > 0)); do
     case "$1" in
